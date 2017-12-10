@@ -48,9 +48,9 @@ def calibrate_camera(image_dir, dimensions, output_corners_found, output_undisto
             # Output images with corners found.
             if output_corners_found is not None:
                 cv2.drawChessboardCorners(img, dimensions, corners, ret)
-                write_fname = os.path.join(output_corners_found, os.path.basename(fname))
-                print(write_fname)
-                cv2.imwrite(write_fname, img)
+                out_fname = os.path.join(output_corners_found, os.path.basename(fname))
+                print(out_fname)
+                cv2.imwrite(out_fname, img)
 
     # Calibrate camera.
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, image_size, None, None)
@@ -60,9 +60,9 @@ def calibrate_camera(image_dir, dimensions, output_corners_found, output_undisto
         for fname in images:
             img = cv2.imread(fname)
             undist = cv2.undistort(img, mtx, dist, None, mtx)
-            write_fname = os.path.join(output_undistort, os.path.basename(fname))
-            print(write_fname)
-            cv2.imwrite(write_fname, undist)
+            out_fname = os.path.join(output_undistort, os.path.basename(fname))
+            print(out_fname)
+            cv2.imwrite(out_fname, undist)
 
     return mtx, dist
 
@@ -70,15 +70,15 @@ def calibrate_camera(image_dir, dimensions, output_corners_found, output_undisto
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--image-dir', type=str, required=False, default='./camera_cal',
-                        help='Path to the chessboard calibration images')
+                        help='Directory of the chessboard calibration images')
     parser.add_argument('--chessboard-dim', type=str, required=False, default='9,6',
                         help='Comma separated 2-tuple for chessboard dimensions (width, height)')
     parser.add_argument('--output-corners-found', type=str, required=False,
-                        help='Path to optionally output the images with corners found')
+                        help='Directory to optionally output the images with corners found')
     parser.add_argument('--output-undistort', type=str, required=False,
-                        help='Path to optionally output the undistorted images')
+                        help='Directory to optionally output the undistorted images')
     parser.add_argument('--output-file', type=str, required=False, default='./calibration-params.p',
-                        help='Output pickle for the calibration parameters')
+                        help='Output pickle file for the calibration parameters')
     x = parser.parse_args()
 
     chessboard_dim = tuple([int(d) for d in x.chessboard_dim.split(',')])
