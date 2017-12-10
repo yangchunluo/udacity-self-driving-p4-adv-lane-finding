@@ -10,38 +10,47 @@ from moviepy.editor import VideoFileClip
 def get_img_size(img):
     """
     Get image size
-    :param img: OpenCV image
+    :param img: image pixels array
     :return: a tuple of width and height
     """
     return img.shape[1], img.shape[0]
 
 
-def output_img(img, dir, filename):
+def output_img(img, path):
     """
     Write image as an output file.
-    :param img: OpenCV image
-    :param dir: output directory, create if not exists
-    :param filename: filename
+    :param img: image pixels array, in BGR color space or gray scale
+    :param path: output file path
     """
-    if not os.path.exists(dir):
-        print("Creating " + dir)
-        os.mkdir(dir)
-    out_fname = os.path.join(dir, filename)
-    print("Writing " + out_fname)
-    cv2.imwrite(out_fname, img)
+    # Recursively creating the directories leading to this path
+    dirs = [path]
+    for _ in range(2):
+        dirs.append(os.path.dirname(dirs[-1]))
+    for d in dirs[:0:-1]:
+        if not os.path.exists(d):
+            os.mkdir(d)
+    # If color image, convert to BGR to write (cv2.imwrite takes BGR image).
+    # Otherwise it is gray scale.
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    cv2.imwrite(path, img)
 
 
 def undistort(img, mtx, dist):
-    """Correct camera distortion"""
+    """
+    Correct camera distortion
+    :param img: image pixels array, in BGR color space
+    """
     return cv2.undistort(img, mtx, dist, None, mtx)
 
 
 def mask_lane_pixels(img, sobelx_thresh, color_thresh):
-    """Mask lane pixels using gradient and color space information"""
-    img = np.copy(img)
-
+    """
+    Mask lane pixels using gradient and color space information
+    :param img: image pixels array, in BGR color space
+    """
     # Convert to HLS color space
-    hls = cv2.cvtColor(img, cv2.COLOR_GRB2HLS).astype(np.float)
+    hls = cv2.cvtColor(img, cv2.COLOR_RGB2HLS).astype(np.float)
     l_channel = hls[:, :, 1]
     s_channel = hls[:, :, 2]
 
@@ -59,10 +68,10 @@ def mask_lane_pixels(img, sobelx_thresh, color_thresh):
     s_binary[(s_channel >= color_thresh[0]) & (s_channel <= color_thresh[1])] = 1
 
     # Stack each channel for visualization
-    masked_color = np.dstack((np.zeros_like(sx_binary),  # Blue
+    masked_color = np.dstack((np.zeros_like(sx_binary),  # Red
                               sx_binary,                 # Green
-                              s_binary)                  # Red
-                             ) * 255                     # cv2.imwrite is BGR
+                              s_binary)                  # Blue
+                             ) * 255
 
     # Combining gradient and color thresholding
     masked = np.zeros_like(s_binary)
@@ -72,38 +81,41 @@ def mask_lane_pixels(img, sobelx_thresh, color_thresh):
 
 
 def transform_perspective(img, src_pts, dst_pts, img_size):
-    """Perspective transform"""
+    """
+    Perspective transform
+    :param img: image pixels array, in BGR color space
+    """
     M = cv2.getPerspectiveTransform(src_pts, dst_pts)
     Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
     warped = cv2.warpPerspective(img, M, img_size)
     return warped, M, Minv
 
 
-def preprocess_image(img, mtx, dist, output_dir, output_fname):
+def preprocess_image(img, mtx, dist, output_dir, img_fname):
     """
     Preprocessing pipeline for an image.
-    :param img: OpenCV read-in image, in BGR color space
+    :param img: image pixels array, in BGR color space
     :param mtx: for camera calibration
     :param dist: for camera calibration
     :param output_dir: output directory
-    :param output_fname: output filename, None for disabling output
+    :param img_fname: output filename for this image, None for disabling output
     :return: preprocessed image
     """
     img_size = get_img_size(img)  # (width, height)
 
     # Un-distort image
     undist = undistort(img, mtx, dist)
-    if output_fname is not None:
-        output_img(undist, os.path.join(output_dir, 'test-undistort'), output_fname)
+    if img_fname is not None:
+        output_img(undist, os.path.join(output_dir, 'test-undistort', img_fname))
 
     # Mask lane pixels
     masked, masked_color = mask_lane_pixels(img, sobelx_thresh=(20, 100), color_thresh=(170, 255))
-    if output_fname is not None:
-        output_img(masked_color, os.path.join(output_dir, 'test-masked_color'), output_fname)
-        output_img(masked, os.path.join(output_dir, 'test-masked'), output_fname)
+    if img_fname is not None:
+        output_img(masked_color, os.path.join(output_dir, 'test-masked_color', img_fname))
+        output_img(masked, os.path.join(output_dir, 'test-masked', img_fname))
 
     # Perspective transform
-    # Source points are measured manually from test_images/straight_lines1.jpg by finding a trapezoid
+    # Source points are measured manually from test_images/straight_lines1.jpg by finding a trapezoid.
     src_points = np.float32([
         [576.0, 463.5],  # Top left
         [706.5, 463.5],  # Top right
@@ -118,27 +130,34 @@ def preprocess_image(img, mtx, dist, output_dir, output_fname):
         [980, img_size[1]]
     ])
     warped, M, Minv = transform_perspective(masked, src_points, dst_points, img_size)
-    if output_fname is not None:
-        output_img(warped, os.path.join(output_dir, 'test-masked-warped'), output_fname)
+    if img_fname is not None:
+        output_img(warped, os.path.join(output_dir, 'test-masked-warped', img_fname))
 
-    return undist
+    return masked_color
 
-idx = 0
-def get_fname():
-    global idx
 
+def fname_generator(max_num_frame=None):
+    """Generator for output filename for each frame"""
+    idx = 0
+    while True:
+        idx += 1
+        if max_num_frame and idx > max_num_frame:
+            yield None  # Stop producing per-frame image output.
+        else:
+            yield 'video-frame-{}.jpg'.format(idx)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--calibration-file', type=str, required=False, default='./calibration-params.p',
                         help='File path for camera calibration parameters')
-    parser.add_argument('--image-dir', type=str, required=False,
+    parser.add_argument('--image-dir', type=str, required=False, #default='./test_images',
                         help='Directory of images to process')
-    parser.add_argument('--video-file', type=str, required=False, default='./project_video.mp4',
+    parser.add_argument('--video-file', type=str, required=False, default='project_video.mp4',
                         help="Video file to process")
     x = parser.parse_args()
 
+    # Load camera calibration parameters.
     dist_pickle = pickle.load(open(x.calibration_file, "rb"))
     mtx = dist_pickle["mtx"]
     dist = dist_pickle["dist"]
@@ -148,10 +167,11 @@ if __name__ == "__main__":
         for fname in images:
             # Read in image file
             img = cv2.imread(fname)  # BGR
-            preprocess_image(img, mtx, dist, os.path.basename(fname))
+            warped = preprocess_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+                                      mtx, dist, 'output_images_test', os.path.basename(fname))
     elif x.video_file:
-        clip = VideoFileClip(x.video_file).subclip(0, 1)
-        write_clip = clip.fl_image(lambda frame:
-                                   preprocess_image(frame,  # RGB
-                                                    mtx, dist, None))
-        write_clip.write_videofile('./test-video.mp4', audio=False)
+        gen = fname_generator(max_num_frame=10)
+        clip = VideoFileClip(x.video_file) #.subclip(0, 1)
+        write_clip = clip.fl_image(lambda frame:  # RGB
+            preprocess_image(frame,  mtx, dist, 'output_images_' + x.video_file, next(gen)))
+        write_clip.write_videofile('./project_video_warped.mp4', audio=False)
