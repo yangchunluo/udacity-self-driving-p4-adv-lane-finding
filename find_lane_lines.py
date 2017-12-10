@@ -133,7 +133,30 @@ def preprocess_image(img, mtx, dist, output_dir, img_fname):
     if img_fname is not None:
         output_img(warped, os.path.join(output_dir, 'test-masked-warped', img_fname))
 
-    return masked_color
+    # Overlay some intermediate output on the original image for visualization.
+    insert_image(img, cv2.resize(masked_color, (img_size[0] // 5, img_size[1] // 5)),
+                 x=img_size[0] * .75, y=img_size[1] * 0.1)
+    insert_image(img, cv2.resize(warped, (img_size[0] // 5, img_size[1] // 5)),
+                 x=img_size[0] * .75, y=img_size[1] * .35)
+
+    return img
+
+
+def insert_image(canvas, insert, x, y):
+    """
+    Overlay a small image on a background image as an insert.
+    :param canvas: background image
+    :param insert: inserted image
+    :param x: ROI x position
+    :param y: ROI y position
+    """
+    x = int(x)
+    y = int(y)
+    if len(insert.shape) == 3:
+        canvas[y:y + insert.shape[0], x:x + insert.shape[1]] = insert
+    else:
+        for i in range(3):
+            canvas[y:y + insert.shape[0], x:x + insert.shape[1], i] = insert
 
 
 def fname_generator(max_num_frame=None):
@@ -167,11 +190,12 @@ if __name__ == "__main__":
         for fname in images:
             # Read in image file
             img = cv2.imread(fname)  # BGR
-            warped = preprocess_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
-                                      mtx, dist, 'output_images_test', os.path.basename(fname))
+            out = preprocess_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+                                   mtx, dist, 'output_images', os.path.basename(fname))
+            output_img(out, os.path.join('output_images', os.path.basename(fname)))
     elif x.video_file:
         gen = fname_generator(max_num_frame=10)
-        clip = VideoFileClip(x.video_file) #.subclip(0, 1)
+        clip = VideoFileClip(x.video_file) #.subclip(0, 6)
         write_clip = clip.fl_image(lambda frame:  # RGB
             preprocess_image(frame,  mtx, dist, 'output_images_' + x.video_file, next(gen)))
-        write_clip.write_videofile('./project_video_warped.mp4', audio=False)
+        write_clip.write_videofile('./project_video_overlay.mp4', audio=False)
