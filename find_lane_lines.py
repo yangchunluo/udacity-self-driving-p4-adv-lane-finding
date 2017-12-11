@@ -5,6 +5,7 @@ import pickle
 import glob
 import numpy as np
 from moviepy.editor import VideoFileClip
+from collections import namedtuple
 
 
 def get_img_size(img):
@@ -27,7 +28,7 @@ def output_img(img, path):
     for _ in range(2):
         dirs.append(os.path.dirname(dirs[-1]))
     for d in dirs[:0:-1]:
-        if not os.path.exists(d):
+        if d and not os.path.exists(d):
             os.mkdir(d)
     # If color image, convert to BGR to write (cv2.imwrite takes BGR image).
     # Otherwise it is gray scale.
@@ -93,13 +94,13 @@ def transform_perspective(img, src_pts, dst_pts, img_size):
 
 def preprocess_image(img, mtx, dist, output_dir, img_fname):
     """
-    Preprocessing pipeline for an image.
+    Pre-processing pipeline for an image.
     :param img: image pixels array, in BGR color space
     :param mtx: for camera calibration
     :param dist: for camera calibration
     :param output_dir: output directory
     :param img_fname: output filename for this image, None for disabling output
-    :return: preprocessed image
+    :return: masked image in color (for display), warped image, Minv (for warping back)
     """
     img_size = get_img_size(img)  # (width, height)
 
@@ -129,17 +130,11 @@ def preprocess_image(img, mtx, dist, output_dir, img_fname):
         [260, img_size[1]],
         [980, img_size[1]]
     ])
-    warped, M, Minv = transform_perspective(masked, src_points, dst_points, img_size)
+    warped, _, Minv = transform_perspective(masked, src_points, dst_points, img_size)
     if img_fname is not None:
         output_img(warped, os.path.join(output_dir, 'test-masked-warped', img_fname))
 
-    # Overlay some intermediate output on the original image for visualization.
-    insert_image(img, cv2.resize(masked_color, (img_size[0] // 5, img_size[1] // 5)),
-                 x=img_size[0] * .75, y=img_size[1] * 0.1)
-    insert_image(img, cv2.resize(warped, (img_size[0] // 5, img_size[1] // 5)),
-                 x=img_size[0] * .75, y=img_size[1] * .35)
-
-    return img
+    return masked_color, warped, Minv
 
 
 def insert_image(canvas, insert, x, y):
@@ -152,11 +147,9 @@ def insert_image(canvas, insert, x, y):
     """
     x = int(x)
     y = int(y)
-    if len(insert.shape) == 3:
-        canvas[y:y + insert.shape[0], x:x + insert.shape[1]] = insert
-    else:
-        for i in range(3):
-            canvas[y:y + insert.shape[0], x:x + insert.shape[1], i] = insert
+    if len(insert.shape) < 3:
+        insert = cv2.cvtColor(insert.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+    canvas[y:y + insert.shape[0], x:x + insert.shape[1]] = insert
 
 
 def fname_generator(max_num_frame=None):
@@ -170,13 +163,98 @@ def fname_generator(max_num_frame=None):
             yield 'video-frame-{}.jpg'.format(idx)
 
 
+def detect_lane(warped, num_windows, margin, min_num_pix):
+    """
+    Detect lane pixels
+    :param warped: binary warped image
+    :param num_windows: number of sliding windows on Y
+    :param margin: window margin on X
+    :param min_num_pix: minimum number of pixels in a window
+    :return:
+    """
+    # Take a histogram of the bottom half of the image
+    histogram = np.sum(warped[warped.shape[0] // 2:, :], axis=0)
+    # Find the peak of the left and right halves of the histogram
+    # These will be the starting point for the left and right lines
+    midpoint = np.int(histogram.shape[0] / 2)
+    leftx_base = np.argmax(histogram[:midpoint])
+    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+
+    # Create an color image to draw on and visualize the result
+    canvas = cv2.cvtColor(warped.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+
+    # Identify the x and y positions of all nonzero pixels in the image
+    nonzero = warped.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+
+    class LaneInfo(namedtuple("LaneInfo",
+                              ["x_current", "nonzero_idxs", "fit_coeff"])):
+        """Represent left or right lane information"""
+
+    left_lane = LaneInfo([leftx_base], [], [])
+    right_lane = LaneInfo([rightx_base], [], [])
+
+    # Set height of windows
+    window_height = np.int(warped.shape[0] / num_windows)
+
+    # Slide through the windows one by one
+    for w in range(num_windows):
+        # Identify window boundaries in x and y (and right and left)
+        win_y_low = warped.shape[0] - (w + 1) * window_height
+        win_y_high = warped.shape[0] - w * window_height
+
+        # For left and right lanes
+        for lane, which in [(left_lane, "left"), (right_lane, "right")]:
+            win_x_low = lane.x_current[0] - margin
+            win_x_high = lane.x_current[0] + margin
+
+            # Draw the window on the visualization image
+            cv2.rectangle(canvas, (win_x_low, win_y_low), (win_x_high, win_y_high),
+                          (0, 255, 0), thickness=2)
+
+            # Identify the nonzero pixels in x and y within the window
+            good_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                         (nonzerox >= win_x_low) & (nonzerox < win_x_high)).nonzero()[0]
+            # Append these indices to the lists
+            lane.nonzero_idxs.append(good_inds)
+
+            # If number of good pixels is greater than the threshold, recenter next window on their mean position.
+            if len(good_inds) > min_num_pix:
+                lane.x_current[0] = np.int(np.mean(nonzerox[good_inds]))
+
+    for lane, color in [(left_lane, [255, 0, 0]), (right_lane, [0, 0, 255])]:
+        # Concatenate the arrays of indices
+        nonzero_idx = np.concatenate(lane.nonzero_idxs)
+
+        # Extract line pixel positions
+        x = nonzerox[nonzero_idx]
+        y = nonzeroy[nonzero_idx]
+
+        # Color them
+        canvas[y, x] = color
+
+        # Fit a second order polynomial
+        lane.fit_coeff.extend(np.polyfit(y, x, deg=2))
+
+    # Plot the fitted line onto the canvas
+    ploty = np.linspace(0, warped.shape[0] - 1, warped.shape[0])
+    for lane in [left_lane, right_lane]:
+        fitx = lane.fit_coeff[0] * ploty ** 2 + lane.fit_coeff[1] * ploty + lane.fit_coeff[2]
+        # The equivalent of matplotlib.pyplot.plot(fitx, ploty)
+        for x, y in zip(fitx, ploty):
+            cv2.circle(canvas, center=(int(x), int(y)), radius=3, color=[255, 255, 0], thickness=2)
+
+    return canvas
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--calibration-file', type=str, required=False, default='./calibration-params.p',
                         help='File path for camera calibration parameters')
-    parser.add_argument('--image-dir', type=str, required=False, #default='./test_images',
+    parser.add_argument('--image-dir', type=str, required=False, default='./test_images',
                         help='Directory of images to process')
-    parser.add_argument('--video-file', type=str, required=False, default='project_video.mp4',
+    parser.add_argument('--video-file', type=str, required=False, #default='project_video.mp4',
                         help="Video file to process")
     x = parser.parse_args()
 
@@ -187,12 +265,28 @@ if __name__ == "__main__":
 
     if x.image_dir:
         images = glob.glob(os.path.join(x.image_dir, "*.jpg"))
+        #images = ['./test_images/straight_lines1.jpg']
         for fname in images:
             # Read in image file
             img = cv2.imread(fname)  # BGR
-            out = preprocess_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
-                                   mtx, dist, 'output_images', os.path.basename(fname))
-            output_img(out, os.path.join('output_images', os.path.basename(fname)))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # RGB
+            img_size = get_img_size(img)
+
+            # Preprocess image
+            masked_color, warped, Minv = preprocess_image(img, mtx, dist, 'output_images', os.path.basename(fname))
+
+            # Detect lane
+            warped_window = detect_lane(warped, num_windows=9, margin=100, min_num_pix=50)
+
+            # Overlay some intermediate output on the original image for visualization.
+            insert_image(img, cv2.resize(masked_color, (img_size[0] // 3, img_size[1] // 3)),
+                         x=img_size[0] * .65, y=img_size[1] * .03)
+            insert_image(img, cv2.resize(warped_window, (img_size[0] // 3, img_size[1] // 3)),
+                         x=img_size[0] * .65, y=img_size[1] * .40)
+
+            output_img(img, os.path.join('output_images', os.path.basename(fname)))
+
+
     elif x.video_file:
         gen = fname_generator(max_num_frame=10)
         clip = VideoFileClip(x.video_file) #.subclip(0, 6)
