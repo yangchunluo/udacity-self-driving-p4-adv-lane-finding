@@ -100,7 +100,7 @@ def preprocess_image(img, mtx, dist, output_dir, img_fname):
     :param dist: for camera calibration
     :param output_dir: output directory
     :param img_fname: output filename for this image, None for disabling output
-    :return: masked image in color (for display), warped image, Minv (for warping back)
+    :return: undistorted image, masked image in color, warped image, Minv (for warping back)
     """
     img_size = get_img_size(img)  # (width, height)
 
@@ -120,8 +120,8 @@ def preprocess_image(img, mtx, dist, output_dir, img_fname):
     src_points = np.float32([
         [576.0, 463.5],  # Top left
         [706.5, 463.5],  # Top right
-        [232.0, 700.0],  # Bottom left
-        [1069.0, 700.0]  # Bottom right
+        [208.0, 720.0],  # Bottom left
+        [1095.0, 720.0]  # Bottom right
     ])
     # Destination points are the corresponding rectangle
     dst_points = np.float32([
@@ -134,7 +134,7 @@ def preprocess_image(img, mtx, dist, output_dir, img_fname):
     if img_fname is not None:
         output_img(warped, os.path.join(output_dir, 'test-masked-warped', img_fname))
 
-    return masked_color, warped, Minv
+    return undist, masked_color, warped, Minv
 
 
 def insert_image(canvas, insert, x, y):
@@ -163,15 +163,20 @@ def fname_generator(max_num_frame=None):
             yield 'video-frame-{}.jpg'.format(idx)
 
 
-def detect_lane(warped, num_windows, margin, min_num_pix):
+def detect_lane(warped, num_windows, margin, recenter_threshold):
     """
     Detect lane pixels
     :param warped: binary warped image
     :param num_windows: number of sliding windows on Y
     :param margin: window margin on X
-    :param min_num_pix: minimum number of pixels in a window
+    :param recenter_threshold: a tuple of (t1, t2), if # pixels in the window < t1, recenter window back to base
+                               if # pixels in the window > t2, recenter window to the mean the current window
     :return:
     """
+    ym_per_pixel = 30.0 / 720
+    xm_per_pixel = 3.7 / 831
+
+    debug = False
     # Take a histogram of the bottom half of the image
     histogram = np.sum(warped[warped.shape[0] // 2:, :], axis=0)
     # Find the peak of the left and right halves of the histogram
@@ -180,8 +185,14 @@ def detect_lane(warped, num_windows, margin, min_num_pix):
     leftx_base = np.argmax(histogram[:midpoint])
     rightx_base = np.argmax(histogram[midpoint:]) + midpoint
 
-    # Create an color image to draw on and visualize the result
+    # Create a color image to draw on and visualize the result
     canvas = cv2.cvtColor(warped.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+
+    # Create a color image to draw the lane region
+    region = cv2.cvtColor(np.zeros_like(warped).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+
+    # Create a color image to draw the lane pixels
+    pixels = cv2.cvtColor(np.zeros_like(warped).astype(np.uint8), cv2.COLOR_GRAY2RGB)
 
     # Identify the x and y positions of all nonzero pixels in the image
     nonzero = warped.nonzero()
@@ -209,7 +220,7 @@ def detect_lane(warped, num_windows, margin, min_num_pix):
             win_x_low = lane.x_current[0] - margin
             win_x_high = lane.x_current[0] + margin
 
-            # Draw the window on the visualization image
+            # Draw the window for visualization
             cv2.rectangle(canvas, (win_x_low, win_y_low), (win_x_high, win_y_high),
                           (0, 255, 0), thickness=2)
 
@@ -219,42 +230,111 @@ def detect_lane(warped, num_windows, margin, min_num_pix):
             # Append these indices to the lists
             lane.nonzero_idxs.append(good_inds)
 
-            # If number of good pixels is greater than the threshold, recenter next window on their mean position.
-            if len(good_inds) > min_num_pix:
+            # If number of good pixels > the threshold, recenter next window on their mean position.
+            if len(good_inds) > recenter_threshold[1]:
                 lane.x_current[0] = np.int(np.mean(nonzerox[good_inds]))
+                debug and print(w, which, 'updated', lane.x_current)
+            # If number of good pixels < the threshold, recenter next window to base.
+            elif len(good_inds) < recenter_threshold[0]:
+                lane.x_current[0] = leftx_base if which == "left" else rightx_base
+                debug and print(w, which, "reverted", lane.x_current)
+            else:
+                debug and print(w, which, 'remained', lane.x_current)
 
-    for lane, color in [(left_lane, [255, 0, 0]), (right_lane, [0, 0, 255])]:
+    def poly_value(yval, coeffs):
+        return coeffs[0] * yval ** 2 + coeffs[1] * yval + coeffs[2]
+
+    def radius_of_curvature(yval, coeffs):
+        return ((1 + (2 * coeffs[0] * yval + coeffs[1]) ** 2) ** 1.5) / np.absolute(2 * coeffs[0])
+
+    # Fit the curve
+    ploty = np.linspace(0, warped.shape[0] - 1, warped.shape[0])
+    region_pts = []
+    lane_radius = []
+    lane_xpos = []
+    for lane, color, which in [(left_lane, [255, 0, 0], 'left'),
+                               (right_lane, [0, 0, 255], 'right')]:
         # Concatenate the arrays of indices
         nonzero_idx = np.concatenate(lane.nonzero_idxs)
-
         # Extract line pixel positions
-        x = nonzerox[nonzero_idx]
-        y = nonzeroy[nonzero_idx]
+        lane_x = nonzerox[nonzero_idx]
+        lane_y = nonzeroy[nonzero_idx]
+        # Color the pixels for visualization
+        canvas[lane_y, lane_x] = color
+        pixels[lane_y, lane_x] = color
 
-        # Color them
-        canvas[y, x] = color
+        # Fit a second order polynomial on pixel distance
+        coeff_pixel = np.polyfit(lane_y, lane_x, deg=2)
 
-        # Fit a second order polynomial
-        lane.fit_coeff.extend(np.polyfit(y, x, deg=2))
+        # Fit a second order polynomial on world distance
+        coeff_world = np.polyfit(lane_y * ym_per_pixel, lane_x * xm_per_pixel, deg=2)
 
-    # Plot the fitted line onto the canvas
-    ploty = np.linspace(0, warped.shape[0] - 1, warped.shape[0])
-    for lane in [left_lane, right_lane]:
-        fitx = lane.fit_coeff[0] * ploty ** 2 + lane.fit_coeff[1] * ploty + lane.fit_coeff[2]
-        # The equivalent of matplotlib.pyplot.plot(fitx, ploty)
+        # Visualize on the fitted curve on the canvas
+        fitx = poly_value(ploty, coeff_pixel)
+        # The equivalent of matplotlib.pyplot.plot(X, Y)
         for x, y in zip(fitx, ploty):
             cv2.circle(canvas, center=(int(x), int(y)), radius=3, color=[255, 255, 0], thickness=2)
 
-    return canvas
+        # Generate the polygon points to draw the fitted lane region.
+        pts = np.transpose(np.vstack([fitx, ploty]))
+        if which == 'right':
+            # So that when h-stacked later, the bottom left lane is adjacent to the bottom right lane (U-shape).
+            pts = np.flipud(pts)
+        region_pts.append(np.array([pts]))  # Don't miss the [] around pts
+
+        # Compute radius of curvature and lane X position where the vehicle is (bottom of the view).
+        curv = radius_of_curvature(np.max(ploty) * ym_per_pixel, coeff_world)
+        debug and print(which, "curvature", curv)
+        lane_radius.append(curv)
+        lane_xpos.append(poly_value(np.max(ploty), coeff_pixel))
+
+    # Draw the region between left and right lanes.
+    cv2.fillPoly(region, np.int_([np.hstack(region_pts)]), (0, 255, 0))
+
+    avg_radius = np.mean(lane_radius)
+    dist_center = (midpoint - np.mean(lane_xpos)) * xm_per_pixel
+    return canvas, region, pixels, avg_radius, dist_center
+
+
+def process_pipeline(img, mtx, dist, output_dir, img_base_fname):
+    img_size = get_img_size(img)
+
+    # Preprocess image
+    undist, masked_color, warped, Minv = preprocess_image(img, mtx, dist, output_dir, img_base_fname)
+
+    # Detect lane
+    window, region, pixels, radius, distance = detect_lane(
+        warped, num_windows=9, margin=75, recenter_threshold=(10, 100))
+
+    # Overlay intermediate outputs on the original image.
+    insert_image(undist, cv2.resize(masked_color, (img_size[0] // 3, img_size[1] // 3)),
+                 x=img_size[0] * .65, y=img_size[1] * .03)
+    insert_image(undist, cv2.resize(window, (img_size[0] // 3, img_size[1] // 3)),
+                 x=img_size[0] * .65, y=img_size[1] * .40)
+
+    # Highlight the lanes on the original image. First warp it back.
+    warpback = cv2.warpPerspective(region, Minv, img_size)
+    result = cv2.addWeighted(undist, 1, warpback, 0.3, 0)
+    warpback = cv2.warpPerspective(pixels, Minv, img_size)
+    result = cv2.addWeighted(result, .8, warpback, 1, 0)
+
+    # Add text for curvature and distance to lane center
+    cv2.putText(result, "Radius of Curvature: {:.1f}(m)".format(radius), org=(80, 50),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
+    cv2.putText(result, "Distance to Center: {:.3f}(m) {}".format(
+        abs(distance), 'left' if distance < 0 else 'right'), org=(80, 100),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
+
+    return result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--calibration-file', type=str, required=False, default='./calibration-params.p',
                         help='File path for camera calibration parameters')
-    parser.add_argument('--image-dir', type=str, required=False, default='./test_images',
+    parser.add_argument('--image-dir', type=str, required=False, #default='./test_images',
                         help='Directory of images to process')
-    parser.add_argument('--video-file', type=str, required=False, #default='project_video.mp4',
+    parser.add_argument('--video-file', type=str, required=False, default='project_video.mp4',
                         help="Video file to process")
     x = parser.parse_args()
 
@@ -265,31 +345,17 @@ if __name__ == "__main__":
 
     if x.image_dir:
         images = glob.glob(os.path.join(x.image_dir, "*.jpg"))
-        #images = ['./test_images/straight_lines1.jpg']
-        for fname in images:
-            # Read in image file
+        #images = ['./test_images/test4.jpg']
+        for fname in sorted(images):
+            print(fname)
             img = cv2.imread(fname)  # BGR
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # RGB
-            img_size = get_img_size(img)
+            out = process_pipeline(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mtx, dist,
+                                   'output_images', os.path.basename(fname))
+            output_img(out, os.path.join('output_images', os.path.basename(fname)))
 
-            # Preprocess image
-            masked_color, warped, Minv = preprocess_image(img, mtx, dist, 'output_images', os.path.basename(fname))
-
-            # Detect lane
-            warped_window = detect_lane(warped, num_windows=9, margin=100, min_num_pix=50)
-
-            # Overlay some intermediate output on the original image for visualization.
-            insert_image(img, cv2.resize(masked_color, (img_size[0] // 3, img_size[1] // 3)),
-                         x=img_size[0] * .65, y=img_size[1] * .03)
-            insert_image(img, cv2.resize(warped_window, (img_size[0] // 3, img_size[1] // 3)),
-                         x=img_size[0] * .65, y=img_size[1] * .40)
-
-            output_img(img, os.path.join('output_images', os.path.basename(fname)))
-
-
-    elif x.video_file:
+    if x.video_file:
         gen = fname_generator(max_num_frame=10)
-        clip = VideoFileClip(x.video_file) #.subclip(0, 6)
+        clip = VideoFileClip(x.video_file)  #.subclip(0, 2)
         write_clip = clip.fl_image(lambda frame:  # RGB
-            preprocess_image(frame,  mtx, dist, 'output_images_' + x.video_file, next(gen)))
+            process_pipeline(frame,  mtx, dist, 'output_images_' + x.video_file, next(gen)))
         write_clip.write_videofile('./project_video_overlay.mp4', audio=False)
