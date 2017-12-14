@@ -162,7 +162,7 @@ def fname_generator(max_num_frame=None):
             yield 'video-frame-{}.jpg'.format(idx)
 
 
-class LaneInfo:
+class LineInfo:
     def __init__(self):
         # The fit is valid
         self.fit_valid = False
@@ -170,19 +170,20 @@ class LaneInfo:
         self.fit_coeff = []
 
 
-def detect_lane(warped, lane_infos, num_windows, margin_detect, margin_track, recenter_threshold,
-                output_dir, img_fname):
+def detect_lane(warped, line_infos, num_windows, margin_detect, margin_track, recenter_threshold,
+                line_distance_threshold, output_dir, img_fname):
     """
     Detect lane pixels
     :param warped: binary warped image
-    :param lane_infos: lane information for look-ahead filter, reset, and smoothing, set None for separate images
+    :param line_infos: line information for look-ahead filter, reset, and smoothing, set None for separate images
     :param num_windows: number of sliding windows on Y
     :param margin_detect: margin on X for detecting
     :param margin_track: margin on X for tracking
-    :param output_dir: output directory
-    :param img_fname: output filename for this image, None for disabling output
+    :param line_distance_threshold: threshold for line distance standard deviation, for sanity check
     :param recenter_threshold: a tuple of (t1, t2), if # pixels in the window < t1, recenter window back to base
                                if # pixels in the window > t2, recenter window to the mean the current window
+    :param output_dir: output directory
+    :param img_fname: output filename for this image, None for disabling output
     :return:
     """
     debug = False
@@ -214,9 +215,9 @@ def detect_lane(warped, lane_infos, num_windows, margin_detect, margin_track, re
     xcurrent = xbase
     color = {'left': [255, 0, 0],
              'right': [0, 0, 255]}
-    region_pts = {}
-    lane_radius = {}
-    lane_xpos = {}
+    coeff_pixel = {}
+    coeff_world = {}
+    fitx = {}
 
     def poly_value(yval, coeffs):
         return coeffs[0] * yval ** 2 + coeffs[1] * yval + coeffs[2]
@@ -225,13 +226,22 @@ def detect_lane(warped, lane_infos, num_windows, margin_detect, margin_track, re
         return ((1 + (2 * coeffs[0] * yval + coeffs[1]) ** 2) ** 1.5) / np.absolute(2 * coeffs[0])
 
     # For left and right lanes
+    ploty = np.linspace(0, warped.shape[0] - 1, warped.shape[0])
     for which in ["left", "right"]:
-        is_tracking = lane_infos is not None and lane_infos[which].fit_valid
-
-        if is_tracking:
+        if line_infos is not None and line_infos[which].fit_valid:
             # Tracking mode: search within a margin of previous fitted curve
-            nonzero_idx = ((nonzerox > (poly_value(nonzeroy, lane_infos[which].fit_coeff) - margin_track)) &
-                            (nonzerox < (poly_value(nonzeroy, lane_infos[which].fit_coeff) + margin_track)))
+            nonzeroy_fitx = poly_value(nonzeroy, line_infos[which].fit_coeff)
+            nonzero_idx = ((nonzerox > (nonzeroy_fitx - margin_track)) &
+                           (nonzerox < (nonzeroy_fitx + margin_track)))
+
+            # Draw search window for the tracking mode
+            last_fitx = poly_value(ploty, line_infos[which].fit_coeff)
+            line_window1 = np.array([np.transpose(np.vstack([last_fitx - margin_track, ploty]))])
+            line_window2 = np.array([np.flipud(np.transpose(np.vstack([last_fitx + margin_track, ploty])))])
+            line_pts = np.hstack((line_window1, line_window2))
+            window_img = np.zeros_like(canvas)
+            cv2.fillPoly(window_img, np.int_([line_pts]), (0, 255, 0))
+            canvas = cv2.addWeighted(canvas, 1, window_img, 0.3, 0)
 
         else:
             # Detecting mode: sliding window
@@ -278,50 +288,62 @@ def detect_lane(warped, lane_infos, num_windows, margin_detect, margin_track, re
         pixels[lane_y, lane_x] = color[which]
 
         # Fit a second order polynomial on pixel distance
-        coeff_pixel = np.polyfit(lane_y, lane_x, deg=2)
+        coeff_pixel[which] = np.polyfit(lane_y, lane_x, deg=2)
+        fitx[which] = poly_value(ploty, coeff_pixel[which])
 
         # Fit a second order polynomial on world distance
-        coeff_world = np.polyfit(lane_y * ym_per_pixel, lane_x * xm_per_pixel, deg=2)
+        coeff_world[which] = np.polyfit(lane_y * ym_per_pixel, lane_x * xm_per_pixel, deg=2)
 
+    # Sanity check after both lanes are fitted.
+    xdistances = np.array([lx - rx for lx, rx in zip(fitx['left'], fitx['right'])])
+    stddev = np.std(xdistances)
+    debug and print("std_dev:", stddev)
+    def coeff_to_str(coeff):
+        return "{:.5f} {:.3f} {:.1f}".format(coeff[0], coeff[1], coeff[2])
+    cv2.putText(canvas, "StdDev of line distance: {:.1f}".format(stddev), org=(350, 50),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
+    cv2.putText(canvas, "Left  fit coeff: {}".format(coeff_to_str(coeff_pixel['left'])), org=(350, 100),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
+    cv2.putText(canvas, "Right fit coeff: {}".format(coeff_to_str(coeff_pixel['right'])), org=(350, 150),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
+    success = stddev < line_distance_threshold
+    if line_infos is not None:
+        if not success:
+            cv2.putText(canvas, "Sanity check failed", org=(350, 200),
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(200, 100, 100))
+            for which in ['left', 'right']:
+                line_infos[which].fit_valid = False
+                line_infos[which].fit_coeff = None
+        else:
+            for which in ['left', 'right']:
+                line_infos[which].fit_valid = True
+                line_infos[which].fit_coeff = coeff_pixel[which]
+
+    region_pts = {}
+    for which in ['left', 'right']:
         # Visualize the fitted curve on the canvas
-        ploty = np.linspace(0, warped.shape[0] - 1, warped.shape[0])
-        fitx = poly_value(ploty, coeff_pixel)
         # The equivalent of matplotlib.pyplot.plot(X, Y)
-        for x, y in zip(fitx, ploty):
+        for x, y in zip(fitx[which], ploty):
             cv2.circle(canvas, center=(int(x), int(y)), radius=3, color=[255, 255, 0], thickness=2)
 
-        # Draw search window for the tracking mode
-        if is_tracking:
-            line_window1 = np.array([np.transpose(np.vstack([fitx - margin_track, ploty]))])
-            line_window2 = np.array([np.flipud(np.transpose(np.vstack([fitx + margin_track, ploty])))])
-            line_pts = np.hstack((line_window1, line_window2))
-            window_img = np.zeros_like(canvas)
-            cv2.fillPoly(window_img, np.int_([line_pts]), (0, 255, 0))
-            canvas = cv2.addWeighted(canvas, 1, window_img, 0.3, 0)
-
         # Generate the polygon points to draw the fitted lane region.
-        pts = np.transpose(np.vstack([fitx, ploty]))
+        pts = np.transpose(np.vstack([fitx[which], ploty]))
         if which == 'right':
             # So that when h-stacked later, the bottom left lane is adjacent to the bottom right lane (U-shape).
             pts = np.flipud(pts)
         region_pts[which] = np.array([pts])  # Don't miss the [] around pts
 
-        # Compute radius of curvature and lane X position where the vehicle is (bottom of the view).
-        curv = radius_of_curvature(np.max(ploty) * ym_per_pixel, coeff_world)
-        debug and print(which, "curvature", curv)
-        lane_radius[which] = curv
-        lane_xpos[which] = poly_value(np.max(ploty), coeff_pixel)
-
-        # Update lane info (TODO: perform sanity check after both lanes are detected)
-        if lane_infos is not None:
-            lane_infos[which].fit_valid = True
-            lane_infos[which].fit_coeff = coeff_pixel
-
-    # TODO: sanity check and update lane info
-
     # Draw the region between left and right lanes.
     cv2.fillPoly(region, np.int_([np.hstack(region_pts.values())]), (0, 255, 0))
 
+    # Compute radius of curvature and lane X position where the vehicle is (bottom of the view).
+    lane_radius = {}
+    lane_xpos = {}
+    for which in ['left', 'right']:
+        curv = radius_of_curvature(np.max(ploty) * ym_per_pixel, coeff_world[which])
+        debug and print(which, "curvature", curv)
+        lane_radius[which] = curv
+        lane_xpos[which] = poly_value(np.max(ploty), coeff_pixel[which])
     avg_radius = np.mean(list(lane_radius.values()))
     dist_center = (midpoint - np.mean(list(lane_xpos.values()))) * xm_per_pixel
 
@@ -348,8 +370,8 @@ def process_pipeline(img, lane_infos, mtx, dist, output_dir, img_base_fname):
 
     # Detect lane
     window, region, pixels, radius, distance = detect_lane(
-        warped, lane_infos, num_windows=9, margin_detect=75, margin_track=100, recenter_threshold=(10, 100),
-        output_dir=output_dir, img_fname=img_base_fname)
+        warped, lane_infos, num_windows=9, margin_detect=75, margin_track=75, recenter_threshold=(10, 100),
+        line_distance_threshold=30, output_dir=output_dir, img_fname=img_base_fname)
 
     # Overlay intermediate outputs on the original image.
     insert_image(undist, cv2.resize(masked_color, (img_size[0] // 3, img_size[1] // 3)),
@@ -400,9 +422,9 @@ if __name__ == "__main__":
 
     if x.video_file:
         gen = fname_generator(max_num_frame=10)
-        clip = VideoFileClip(x.video_file).subclip(0, 10)
-        lane_infos = {'left': LaneInfo(), 'right': LaneInfo()}
+        clip = VideoFileClip(x.video_file).subclip(38, 44)
+        lane_infos = {'left': LineInfo(), 'right': LineInfo()}
         write_clip = clip.fl_image(lambda frame:  # RGB
             process_pipeline(frame, lane_infos, mtx, dist,
                              'output_images_' + os.path.basename(x.video_file), next(gen)))
-        write_clip.write_videofile('./project_video_overlay.mp4', audio=False)
+        write_clip.write_videofile('./project_video_overlay1.mp4', audio=False)
