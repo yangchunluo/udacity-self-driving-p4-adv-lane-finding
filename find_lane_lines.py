@@ -176,6 +176,10 @@ class LaneHistoryInfo:
         self.xbase_position = {}
         # Coefficients of the past fits, smoothed using exponential decay
         self.fit_coeffs = {}
+        # Radius of curvature, smoothed using exponential decay
+        self.radius_of_curvature = None
+        # Distance to center lane, smoothed using exponential decay
+        self.distance_to_center = None
 
         # Constant parameters
         self.decay_rate = 0.8
@@ -190,7 +194,8 @@ def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, rec
     :param num_windows: number of sliding windows on Y
     :param margin_detect: margin on X for detecting
     :param margin_track: margin on X for tracking
-    :param line_distance_threshold: threshold for line distance standard deviation, for sanity check
+    :param line_distance_threshold: threshold for line distance (upper bound of stdDev, lower bound of mean),
+                                    for sanity check
     :param recenter_threshold: a tuple of (t1, t2), if # pixels in the window < t1, recenter window back to base
                                if # pixels in the window > t2, recenter window to the mean the current window
     :param output_dir: output directory
@@ -221,7 +226,7 @@ def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, rec
     nonzeroy = np.array(nonzero[0])
     nonzerox = np.array(nonzero[1])
 
-    midpoint = np.int(warped.shape[0] / 2)
+    midpoint = np.int(warped.shape[1] / 2)
     ploty = np.linspace(0, warped.shape[0] - 1, warped.shape[0])
 
     # 1. find pixels that correspond to a lane line
@@ -314,18 +319,21 @@ def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, rec
     # 3. Sanity check after both lane lines are fitted.
     xdistances = np.array([lx - rx for lx, rx in zip(fitx['left'], fitx['right'])])
     stddev = np.std(xdistances)
-    debug and print("std_dev:", stddev)
+    meandist = abs(np.mean(xdistances))
+    debug and print("std_dev:", stddev, "mean:", meandist)
     def coeff_to_str(coeff):
         return "{:.5f} {:.3f} {:.1f}".format(coeff[0], coeff[1], coeff[2])
     cv2.putText(canvas, "StdDev of line distance: {:.1f}".format(stddev), org=(350, 50),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
-    cv2.putText(canvas, "Left  fit coeff: {}".format(coeff_to_str(coeff_pixel['left'])), org=(350, 100),
+    cv2.putText(canvas, "Mean   of line distance: {:.1f}".format(meandist), org=(350, 100),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
-    cv2.putText(canvas, "Right fit coeff: {}".format(coeff_to_str(coeff_pixel['right'])), org=(350, 150),
+    cv2.putText(canvas, "Left  fit coeff: {}".format(coeff_to_str(coeff_pixel['left'])), org=(350, 150),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
-    success = stddev < line_distance_threshold
+    cv2.putText(canvas, "Right fit coeff: {}".format(coeff_to_str(coeff_pixel['right'])), org=(350, 200),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(255, 255, 255))
+    success = stddev < line_distance_threshold[0] and meandist > line_distance_threshold[1]
     if not success:
-        cv2.putText(canvas, "Sanity check failed", org=(350, 200),
+        cv2.putText(canvas, "Sanity check failed", org=(350, 250),
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, thickness=3, color=(200, 100, 100))
 
     # 4. Draw the region between left and right lane lines.
@@ -352,7 +360,11 @@ def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, rec
         debug and print(which, "curvature", curv)
         lane_radius[which] = curv
         lane_xpos[which] = poly_value(np.max(ploty), coeff_pixel[which])
-    avg_radius = np.mean(list(lane_radius.values()))
+    # Geometric mean is more stable for radius
+    def get_geomean(iterable):
+        a = np.log(iterable)
+        return np.exp(a.sum() / len(a))
+    avg_radius = get_geomean(list(lane_radius.values()))
     dist_center = (midpoint - np.mean(list(lane_xpos.values()))) * xm_per_pixel
 
     # 6. Update lane history
@@ -362,6 +374,10 @@ def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, rec
             lane_hist.fit_coeffs = copy.deepcopy(coeff_pixel)
         if len(lane_hist.xbase_position) == 0:
             lane_hist.xbase_position = copy.deepcopy(lane_xpos)
+        if lane_hist.radius_of_curvature is None:
+            lane_hist.radius_of_curvature = avg_radius
+        if lane_hist.distance_to_center is None:
+            lane_hist.distance_to_center = dist_center
 
         if not success:
             lane_hist.n_continuous_failure += 1
@@ -378,11 +394,17 @@ def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, rec
                 lane_hist.xbase_position[which] += lane_xpos[which] * (1 - rate)
                 lane_hist.fit_coeffs[which] *= rate
                 lane_hist.fit_coeffs[which] += coeff_pixel[which] * (1 - rate)
+                lane_hist.radius_of_curvature *= rate
+                lane_hist.radius_of_curvature += avg_radius * (1 - rate)
+                lane_hist.distance_to_center *= rate
+                lane_hist.distance_to_center += dist_center * (1 - rate)
             lane_hist.n_continuous_failure = 0
 
     if img_fname is not None:
         output_img(canvas, os.path.join(output_dir, 'detect-canvas', img_fname))
-    return canvas, region, pixels, avg_radius, dist_center
+    return (canvas, region, pixels,
+            avg_radius if lane_hist is None else lane_hist.radius_of_curvature,
+            dist_center if lane_hist is None else lane_hist.distance_to_center)
 
 
 def process_pipeline(img, lane_hist, mtx, dist, output_dir, img_base_fname):
@@ -403,8 +425,8 @@ def process_pipeline(img, lane_hist, mtx, dist, output_dir, img_base_fname):
 
     # Detect lane
     window, region, pixels, radius, distance = detect_lane(
-        warped, lane_hist, num_windows=9, margin_detect=75, margin_track=75, recenter_threshold=(10, 100),
-        line_distance_threshold=30, output_dir=output_dir, img_fname=img_base_fname)
+        warped, lane_hist, num_windows=16, margin_detect=75, margin_track=75, recenter_threshold=(10, 100),
+        line_distance_threshold=(30, 500), output_dir=output_dir, img_fname=img_base_fname)
 
     # Overlay intermediate outputs on the original image.
     insert_image(undist, cv2.resize(masked_color, (img_size[0] // 3, img_size[1] // 3)),
@@ -455,9 +477,9 @@ if __name__ == "__main__":
 
     if x.video_file:
         gen = fname_generator(max_num_frame=10)
-        clip = VideoFileClip(x.video_file)
+        clip = VideoFileClip(x.video_file) #.subclip(0,2)
         lane_hist = LaneHistoryInfo()
         write_clip = clip.fl_image(lambda frame:  # RGB
             process_pipeline(frame, lane_hist, mtx, dist,
                              'output_images_' + os.path.basename(x.video_file), next(gen)))
-        write_clip.write_videofile('result_' + os.path.basename(x.video_file), audio=False)
+        write_clip.write_videofile('resultx_' + os.path.basename(x.video_file), audio=False)
