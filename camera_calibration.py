@@ -75,14 +75,13 @@ if __name__ == "__main__":
                         help='Comma separated 2-tuple for chessboard dimensions (width, height)')
     parser.add_argument('--output-corners-found', type=str, required=False,
                         help='Directory to optionally output the images with corners found')
-    parser.add_argument('--output-undistort', type=str, required=False,
+    parser.add_argument('--output-undistort', type=str, required=False, default='output_images/calibrated',
                         help='Directory to optionally output the undistorted images')
     parser.add_argument('--output-file', type=str, required=False, default='./calibration-params.p',
                         help='Output pickle file for the calibration parameters')
     x = parser.parse_args()
 
     chessboard_dim = tuple([int(d) for d in x.chessboard_dim.split(',')])
-    x.output_undistort = os.path.join('output_images', 'undistorted')
     mtx, dist = calibrate_camera(x.image_dir, chessboard_dim, x.output_corners_found, x.output_undistort)
 
     # Save the output file

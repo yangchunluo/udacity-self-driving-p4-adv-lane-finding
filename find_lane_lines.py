@@ -110,7 +110,7 @@ def preprocess_image(img, mtx, dist, output_dir, img_fname):
         output_img(undist, os.path.join(output_dir, 'undistort', img_fname))
 
     # Mask lane pixels
-    masked, masked_color = mask_lane_pixels(img, sobelx_thresh=(20, 100), color_thresh=(170, 255))
+    masked, masked_color = mask_lane_pixels(undist, sobelx_thresh=(20, 100), color_thresh=(170, 255))
     if img_fname is not None:
         output_img(masked_color, os.path.join(output_dir, 'masked_color', img_fname))
         output_img(masked, os.path.join(output_dir, 'masked', img_fname))
@@ -482,4 +482,4 @@ if __name__ == "__main__":
         write_clip = clip.fl_image(lambda frame:  # RGB
             process_pipeline(frame, lane_hist, mtx, dist,
                              'output_images_' + os.path.basename(x.video_file), next(gen)))
-        write_clip.write_videofile('resultx_' + os.path.basename(x.video_file), audio=False)
+        write_clip.write_videofile('result_' + os.path.basename(x.video_file), audio=False)
