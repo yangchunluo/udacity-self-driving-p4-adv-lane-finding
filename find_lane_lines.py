@@ -185,6 +185,7 @@ class LaneHistoryInfo:
         self.decay_rate = 0.8
         self.continuous_failure_threshold = 5
 
+
 def detect_lane(warped, lane_hist, num_windows, margin_detect, margin_track, recenter_threshold,
                 line_distance_threshold, output_dir, img_fname):
     """
